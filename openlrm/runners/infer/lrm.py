@@ -31,6 +31,10 @@ from openlrm.runners import REGISTRY_RUNNERS
 from openlrm.utils.video import images_to_video
 from openlrm.utils.hf_hub import wrap_model_hub
 
+from basic_marching_tet.grid import RegularGrid
+from basic_marching_tet.sdf import grid2sdf
+from basic_marching_tet.mt import mt
+
 
 logger = get_logger(__name__)
 
@@ -40,6 +44,7 @@ def parse_configs():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str)
     parser.add_argument('--infer', type=str)
+    parser.add_argument('--mt', action='store_true')
     args, unknown = parser.parse_known_args()
 
     cfg = OmegaConf.create()
@@ -64,6 +69,10 @@ def parse_configs():
         cfg.merge_with(cfg_infer)
         cfg.setdefault('video_dump', os.path.join("dumps", cli_cfg.model_name, 'videos'))
         cfg.setdefault('mesh_dump', os.path.join("dumps", cli_cfg.model_name, 'meshes'))
+        
+    cli_cfg.setdefault('mt', False)
+    if args.mt:
+        cli_cfg.mt = True
 
     cfg.merge_with(cli_cfg)
 
@@ -200,14 +209,30 @@ class LRMInferrer(Inferrer):
             grid_size=mesh_size,
         )
         
-        vtx, faces = mcubes.marching_cubes(grid_out['sigma'].squeeze(0).squeeze(-1).cpu().numpy(), mesh_thres)
-        vtx = vtx / (mesh_size - 1) * 2 - 1
+        if self.cfg.mt:
+            grid = RegularGrid(device=self.device)
+            grid.init(domain_min=(-1, -1, -1), domain_max=(1, 1, 1), grid_size=2.0 / 48.0)
+            
+            grid_sdf = grid_out['sigma'].squeeze(0).squeeze(-1)
+            sdf = lambda x: grid2sdf(grid_sdf, x, (-1.0, -1.0, -1.0), 2.0 / (mesh_size - 1), layout="XYZ")
+            grid_verts_sdf = -(sdf(grid.verts) - mesh_thres)
+            vtx, tets, faces = mt(grid.verts, grid.tet_idx, grid_verts_sdf)
+            
+            vtx_tensor = vtx.unsqueeze(0)
+            
+            vtx_colors = self.model.synthesizer.forward_points(planes, vtx_tensor)['rgb'].squeeze(0).cpu().numpy()  # (0, 1)
+            vtx_colors = (vtx_colors * 255).astype(np.uint8)
+            
+            mesh = trimesh.Trimesh(vertices=vtx.cpu().numpy(), faces=faces.cpu().numpy(), vertex_colors=vtx_colors)
+        else:
+            vtx, faces = mcubes.marching_cubes(grid_out['sigma'].squeeze(0).squeeze(-1).cpu().numpy(), mesh_thres)
+            vtx = vtx / (mesh_size - 1) * 2 - 1
 
-        vtx_tensor = torch.tensor(vtx, dtype=torch.float32, device=self.device).unsqueeze(0)
-        vtx_colors = self.model.synthesizer.forward_points(planes, vtx_tensor)['rgb'].squeeze(0).cpu().numpy()  # (0, 1)
-        vtx_colors = (vtx_colors * 255).astype(np.uint8)
-        
-        mesh = trimesh.Trimesh(vertices=vtx, faces=faces, vertex_colors=vtx_colors)
+            vtx_tensor = torch.tensor(vtx, dtype=torch.float32, device=self.device).unsqueeze(0)
+            vtx_colors = self.model.synthesizer.forward_points(planes, vtx_tensor)['rgb'].squeeze(0).cpu().numpy()  # (0, 1)
+            vtx_colors = (vtx_colors * 255).astype(np.uint8)
+            
+            mesh = trimesh.Trimesh(vertices=vtx, faces=faces, vertex_colors=vtx_colors)
 
         # dump
         os.makedirs(os.path.dirname(dump_mesh_path), exist_ok=True)
